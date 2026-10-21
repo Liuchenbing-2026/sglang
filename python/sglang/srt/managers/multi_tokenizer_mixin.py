@@ -38,7 +38,7 @@ import setproctitle
 import zmq
 import zmq.asyncio
 
-from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.environ import envs
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
@@ -878,11 +878,19 @@ class TokenizerWorker(TokenizerManager):
         )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
+        was_paused = self.is_pause
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
-        # Send to router which will broadcast to all workers
-        # (router also handles forwarding to scheduler for non-abort modes)
-        self._dispatch_to_scheduler(obj)
+        # Send one command to the router, preserving its single broadcast reply.
+        # Retract a previously paused aggregate batch without reopening forward.
+        dispatch_obj = obj
+        if (
+            was_paused
+            and obj.mode == "abort"
+            and self.disaggregation_mode == DisaggregationMode.NULL
+        ):
+            dispatch_obj = msgspec.structs.replace(obj, mode="retract")
+        self._dispatch_to_scheduler(dispatch_obj)
         await self._pause_continue_future
 
         if obj.mode == "abort":

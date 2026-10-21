@@ -48,6 +48,7 @@ from typing import (
 )
 
 import fastapi
+import msgspec
 import numpy as np
 import pybase64
 import torch
@@ -2278,10 +2279,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
+            was_paused = self.is_pause
             self.is_pause = True
             if obj.mode != "abort":
                 await self._async_dispatch_to_scheduler(obj)
             else:
+                if was_paused and self.disaggregation_mode == DisaggregationMode.NULL:
+                    # Abort can finish retracted requests without reopening forward.
+                    await self._async_dispatch_to_scheduler(
+                        msgspec.structs.replace(obj, mode="retract")
+                    )
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
                     # TODO: maybe make it async instead of fire-and-forget
