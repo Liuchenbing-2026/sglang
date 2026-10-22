@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -33,8 +33,10 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
+    BatchTokenizedGenerateReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
+    TokenizedGenerateReqInput,
     wrap_as_pickle,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
@@ -1428,6 +1430,182 @@ class TestPriorityRange(CustomTestCase):
                         with self.assertRaisesRegex(ValueError, "signed 64-bit"):
                             asyncio.run(tm.generate_request(obj).__anext__())
                         tm._init_req_state.assert_not_called()
+
+
+class TestDisconnectBeforeDispatch(CustomTestCase):
+    """A client lost during asynchronous preparation must not reach the scheduler."""
+
+    async def _run_request(self, stage, *, background=False, with_request=True):
+        tm = _make_tm_for_generate(self)
+        obj = GenerateReqInput(
+            text="prompt", rid="disconnected-preparation", background=background
+        )
+        disconnected = False
+        dispatched = []
+
+        async def receive():
+            return {"type": "http.disconnect" if disconnected else "http.request"}
+
+        request = Request(
+            {"type": "http", "method": "POST", "path": "/generate"}, receive
+        )
+
+        async def tokenize(_obj):
+            nonlocal disconnected
+            await asyncio.sleep(0)
+            if stage == "tokenization":
+                disconnected = True
+            return SimpleNamespace(
+                rid=obj.rid,
+                mm_inputs=None,
+                time_stats=tm.rid_to_state[obj.rid].time_stats,
+                wrap_pickle_fields=Mock(),
+            )
+
+        async def prepare(_items):
+            nonlocal disconnected
+            await asyncio.sleep(0)
+            if stage == "transport":
+                disconnected = True
+            return ["prepared-mm-resource"]
+
+        def dispatch(tokenized):
+            dispatched.append(tokenized)
+            # Scheduler completion is the explicit external boundary. The real
+            # generate_request and response waiter still own local state.
+            state = tm.rid_to_state[obj.rid]
+
+            def complete():
+                state.finished = True
+                state.out_list.append({"meta_info": {"id": obj.rid}})
+                state.event.set()
+                tm.rid_to_state.pop(obj.rid, None)
+
+            asyncio.get_running_loop().call_soon(complete)
+
+        tm._tokenize_one_request = tokenize
+        tm.cuda_vmm_feature_transport = SimpleNamespace(
+            prepare_for_dispatch_async=prepare,
+            cancel_for_dispatch=Mock(),
+        )
+        tm.positional_embeds_transport = SimpleNamespace(
+            prepare_for_dispatch=Mock(return_value=["prepared-embed-resource"]),
+            cancel_for_dispatch=Mock(),
+        )
+        tm._dispatch_to_scheduler = dispatch
+        generator = tm.generate_request(obj, request if with_request else None)
+        should_abort = stage is not None and not background and with_request
+        try:
+            try:
+                await generator.__anext__()
+            except ValueError as exc:
+                self.assertIn("disconnected", str(exc))
+        finally:
+            await generator.aclose()
+        self.assertEqual(bool(dispatched), not should_abort)
+        self.assertNotIn(obj.rid, tm.rid_to_state)
+        if should_abort:
+            tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once_with(
+                ["prepared-mm-resource"]
+            )
+            tm.positional_embeds_transport.cancel_for_dispatch.assert_called_once_with(
+                ["prepared-embed-resource"]
+            )
+        else:
+            tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_not_called()
+            tm.positional_embeds_transport.cancel_for_dispatch.assert_not_called()
+
+    def test_disconnect_during_tokenization_never_dispatches(self):
+        asyncio.run(self._run_request("tokenization"))
+
+    def test_disconnect_during_transport_preparation_never_dispatches(self):
+        asyncio.run(self._run_request("transport"))
+
+    def test_connected_request_dispatches(self):
+        asyncio.run(self._run_request(None))
+
+    def test_background_request_can_dispatch_after_disconnect(self):
+        asyncio.run(self._run_request("transport", background=True))
+
+    def test_engine_request_without_http_request_dispatches(self):
+        asyncio.run(self._run_request("transport", with_request=False))
+
+    async def _run_batch(self, disconnected):
+        tm = _make_tm_for_generate(self)
+
+        async def receive():
+            return {"type": "http.disconnect" if disconnected else "http.request"}
+
+        request = Request(
+            {"type": "http", "method": "POST", "path": "/generate"}, receive
+        )
+        items = []
+        for rid in ("batch-0", "batch-1"):
+            obj = GenerateReqInput(text="prompt", rid=rid)
+            tm._init_req_state(obj, request)
+            items.append(
+                TokenizedGenerateReqInput(
+                    rid=rid,
+                    input_text="prompt",
+                    input_ids=None,
+                    input_embeds=None,
+                    mm_inputs=None,
+                    token_type_ids=None,
+                    sampling_params=None,
+                    return_logprob=False,
+                    logprob_start_len=-1,
+                    top_logprobs_num=0,
+                    token_ids_logprob=None,
+                    stream=False,
+                    time_stats=tm.rid_to_state[rid].time_stats,
+                )
+            )
+        tm.batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
+        tm.cuda_vmm_feature_transport = SimpleNamespace(
+            prepare_for_dispatch_async=AsyncMock(return_value=["batch-mm-resource"]),
+            cancel_for_dispatch=Mock(),
+        )
+        tm.positional_embeds_transport = SimpleNamespace(
+            prepare_for_dispatch=Mock(return_value=["batch-embed-resource"]),
+            cancel_for_dispatch=Mock(),
+        )
+        tm._dispatch_to_scheduler = Mock()
+        if disconnected:
+            with self.assertRaisesRegex(ValueError, "disconnected"):
+                await tm._send_batch_request(items)
+            tm._dispatch_to_scheduler.assert_not_called()
+            tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once_with(
+                ["batch-mm-resource"]
+            )
+            tm.positional_embeds_transport.cancel_for_dispatch.assert_called_once_with(
+                ["batch-embed-resource"]
+            )
+        else:
+            await tm._send_batch_request(items)
+            tm._dispatch_to_scheduler.assert_called_once()
+            batch = tm._dispatch_to_scheduler.call_args.args[0]
+            self.assertIsInstance(batch, BatchTokenizedGenerateReqInput)
+            self.assertEqual([item.rid for item in batch.batch], ["batch-0", "batch-1"])
+            tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_not_called()
+            tm.positional_embeds_transport.cancel_for_dispatch.assert_not_called()
+        self.assertTrue(
+            all(
+                state.dispatched == (not disconnected)
+                for state in tm.rid_to_state.values()
+            )
+        )
+
+    def test_disconnected_batch_releases_prepared_resources(self):
+        asyncio.run(self._run_batch(True))
+
+    def test_connected_batch_dispatches(self):
+        asyncio.run(self._run_batch(False))
+
+    def test_req_state_retains_positional_completion_tokens(self):
+        state = ReqState(
+            [], False, asyncio.Event(), GenerateReqInput(), APIServerReqTimeStats(), 7
+        )
+        self.assertEqual(state.last_completion_tokens, 7)
 
 
 if __name__ == "__main__":

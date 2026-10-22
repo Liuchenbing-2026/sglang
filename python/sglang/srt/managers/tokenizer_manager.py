@@ -274,6 +274,7 @@ class ReqState:
 
     # For performance metrics
     time_stats: APIServerReqTimeStats
+    request: Optional[fastapi.Request] = dataclasses.field(default=None, kw_only=True)
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -1781,6 +1782,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
         )
 
+    async def _check_client_disconnected(self, rids: Iterable[str]) -> None:
+        for rid in rids:
+            state = self.rid_to_state.get(rid)
+            if (
+                state is not None
+                and state.request is not None
+                and not state.obj.background
+                and await state.request.is_disconnected()
+            ):
+                raise ValueError(
+                    f"Request is disconnected from the client side before dispatch: {rid=}"
+                )
+
     async def _send_one_request(
         self,
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
@@ -1797,6 +1811,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             prepared_embeds = self.positional_embeds_transport.prepare_for_dispatch(
                 (tokenized_obj,)
             )
+            await self._check_client_disconnected((tokenized_obj.rid,))
             tokenized_obj.time_stats.set_api_server_dispatch_time()
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
@@ -1844,6 +1859,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_objs
             )
 
+            await self._check_client_disconnected(obj.rid for obj in tokenized_objs)
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
             for tokenized_obj in tokenized_objs:
@@ -2160,7 +2176,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
-                self._init_req_state(tmp_obj)
+                self._init_req_state(tmp_obj, request)
                 request_states[tmp_obj.rid] = self.rid_to_state[tmp_obj.rid]
                 await self._send_one_request(tokenized_obj)
                 await self._wait_one_response(tmp_obj, request).__anext__()
@@ -2187,7 +2203,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    self._init_req_state(tmp_obj)
+                    self._init_req_state(tmp_obj, request)
                     state = self.rid_to_state[tmp_obj.rid]
                     request_states[tmp_obj.rid] = state
                     tokenized_obj.time_stats = state.time_stats
@@ -3855,6 +3871,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for rid, sub_obj, bootstrap_room in items:
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
+            state.request = request
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
