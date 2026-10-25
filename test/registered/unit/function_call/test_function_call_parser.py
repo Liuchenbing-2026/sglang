@@ -2632,6 +2632,106 @@ null
         self.assertIsInstance(grammar, xgr.Grammar)
 
 
+class TestQwen3CoderOmittedEndings(CustomTestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="inspect",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "days": {"type": "integer"},
+                            "location": {"type": "string"},
+                        },
+                    },
+                ),
+            )
+        ]
+
+    def _check_calls(self, text, expected, chunk_size):
+        detector = Qwen3CoderDetector()
+        if chunk_size is None:
+            calls = detector.detect_and_parse(text, self.tools).calls
+        else:
+            calls = []
+            step = chunk_size or len(text)
+            for offset in range(0, len(text), step):
+                calls.extend(
+                    detector.parse_streaming_increment(
+                        text[offset : offset + step], self.tools
+                    ).calls
+                )
+            calls.extend(detector.finish(self.tools).calls)
+        names = []
+        arguments = {}
+        for call in calls:
+            if call.name:
+                names.append((call.tool_index, call.name))
+            arguments[call.tool_index] = arguments.get(call.tool_index, "") + (
+                call.parameters or ""
+            )
+        self.assertEqual(names, [(index, "inspect") for index in range(len(expected))])
+        self.assertEqual(
+            [json.loads(arguments[index]) for index in sorted(arguments)], expected
+        )
+
+    def test_omitted_function_and_next_call_boundaries(self):
+        start = "<tool_call>\n<function=inspect>\n"
+        first = "<parameter=days>\n0\n</parameter>\n"
+        second = "<parameter=days>\n1\n</parameter>\n"
+        end = "</function>\n</tool_call>"
+        cases = [
+            (start + first + "</tool_call>", [{"days": 0}]),
+            (start + "<parameter=days>\n0\n</tool_call>", [{"days": 0}]),
+            (start + "</tool_call>", [{}]),
+            (start + first + end, [{"days": 0}]),
+            (start + first + end + start + second + end, [{"days": 0}, {"days": 1}]),
+            (start + first + start + second + end, [{"days": 0}, {"days": 1}]),
+            (
+                start + first + "<function=inspect>\n" + second + end,
+                [{"days": 0}, {"days": 1}],
+            ),
+        ]
+        for text, expected in cases:
+            for size in (1, 7, 0):
+                with self.subTest(text=text, chunk_size=size):
+                    self._check_calls(text, expected, size)
+        for text, expected in cases[-2:]:
+            with self.subTest(text=text, mode="nonstream"):
+                self._check_calls(text, expected, None)
+
+    def test_closed_parameter_keeps_literal_boundary_markup(self):
+        for value in ("a</tool_call>b", "a<tool_call><function=not_a_tool>b"):
+            text = (
+                "<tool_call><function=inspect><parameter=location>"
+                + value
+                + "</parameter></function></tool_call>"
+            )
+            for size in (None, 1, 7, 0):
+                with self.subTest(value=value, chunk_size=size):
+                    self._check_calls(text, [{"location": value}], size)
+
+    def test_zero_argument_call_at_next_boundary(self):
+        text = (
+            "<tool_call><function=inspect><tool_call><function=inspect>"
+            "<parameter=days>1</parameter></function></tool_call>"
+        )
+        for size in (None, 1, 7, 0):
+            with self.subTest(chunk_size=size):
+                self._check_calls(text, [{}, {"days": 1}], size)
+
+    def test_finish_does_not_repeat_a_completed_empty_call(self):
+        detector = Qwen3CoderDetector()
+        calls = detector.parse_streaming_increment(
+            "<tool_call><function=inspect></function></tool_call>", self.tools
+        ).calls
+        calls.extend(detector.finish(self.tools).calls)
+        self.assertEqual("".join(call.parameters for call in calls), "{}")
+        self.assertEqual(detector.finish(self.tools).calls, [])
+
+
 class TestGptOssDetector(unittest.TestCase):
     def setUp(self):
         self.tools = [

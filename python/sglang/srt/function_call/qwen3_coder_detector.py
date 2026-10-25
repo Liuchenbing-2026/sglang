@@ -32,9 +32,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self.parameter_end_token: str = "</parameter>"
 
         # Regex for non-streaming fallback
-        self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-        self.tool_call_function_regex = re.compile(
-            r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
+        self.tool_call_boundary_regex = re.compile(
+            r"<tool_call>|</tool_call>|<function=|</function>|<parameter="
         )
         self.tool_call_parameter_regex = re.compile(
             r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
@@ -57,6 +56,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
+        self._stream_ended: bool = False
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
@@ -175,6 +175,44 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 )
             return param_value
 
+    def _split_function_bodies(self, text: str) -> list[str]:
+        """Recover omitted function endings without splitting closed values."""
+        bodies = []
+        start = None
+        inside_tool = False
+        pos = 0
+        while match := self.tool_call_boundary_regex.search(text, pos):
+            token = match.group()
+            pos = match.end()
+            if token == self.parameter_prefix:
+                if start is not None:
+                    # Markup inside an explicitly closed value is literal text.
+                    end = text.find(self.parameter_end_token, pos)
+                    if end != -1:
+                        pos = end + len(self.parameter_end_token)
+                continue
+            if token == self.tool_call_prefix and not inside_tool:
+                continue
+            if start is not None:
+                bodies.append(text[start : match.start()])
+            if token == self.tool_call_start_token:
+                inside_tool = True
+            elif token == self.tool_call_end_token:
+                inside_tool = False
+            start = pos if token == self.tool_call_prefix and inside_tool else None
+        if start is not None:
+            bodies.append(text[start:])
+        return bodies
+
+    def _close_open_function(self, calls: List[ToolCallItem]) -> None:
+        if self.current_func_name is None:
+            return
+        if not self.json_started:
+            calls.append(ToolCallItem(tool_index=self.current_tool_id, parameters="{"))
+            self.json_started = True
+        calls.append(ToolCallItem(tool_index=self.current_tool_id, parameters="}"))
+        self.current_func_name = None
+
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-shot parsing for non-streaming scenarios."""
         if self.tool_call_start_token not in text:
@@ -182,54 +220,40 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         calls = []
         try:
-            # Simple cleanup of the text to find tool calls
-            # Note: This is a simplified regex approach consistent with vLLM
-            raw_tool_calls = self.tool_call_regex.findall(text)
-            if not raw_tool_calls:
-                # Fallback: maybe the whole text is inside the tag or tags are stripped
-                if self.tool_call_prefix in text:
-                    raw_tool_calls = [text]
+            for tool_idx, func_body in enumerate(self._split_function_bodies(text)):
+                if ">" not in func_body:
+                    continue
 
-            tool_idx = 0
-            for tool_content in raw_tool_calls:
-                # Find function calls
-                funcs = self.tool_call_function_regex.findall(tool_content)
-                for func_match in funcs:
-                    func_body = func_match[0] or func_match[1]
-                    if ">" not in func_body:
+                name_end = func_body.index(">")
+                func_name = func_body[:name_end]
+                params_str = func_body[name_end + 1 :]
+
+                param_config = self._get_arguments_config(func_name, tools)
+                parsed_params = {}
+
+                for p_match in self.tool_call_parameter_regex.findall(params_str):
+                    if ">" not in p_match:
                         continue
+                    p_idx = p_match.index(">")
+                    p_name = p_match[:p_idx]
+                    p_val = p_match[p_idx + 1 :]
+                    # Remove prefixing and trailing \n
+                    if p_val.startswith("\n"):
+                        p_val = p_val[1:]
+                    if p_val.endswith("\n"):
+                        p_val = p_val[:-1]
 
-                    name_end = func_body.index(">")
-                    func_name = func_body[:name_end]
-                    params_str = func_body[name_end + 1 :]
-
-                    param_config = self._get_arguments_config(func_name, tools)
-                    parsed_params = {}
-
-                    for p_match in self.tool_call_parameter_regex.findall(params_str):
-                        if ">" not in p_match:
-                            continue
-                        p_idx = p_match.index(">")
-                        p_name = p_match[:p_idx]
-                        p_val = p_match[p_idx + 1 :]
-                        # Remove prefixing and trailing \n
-                        if p_val.startswith("\n"):
-                            p_val = p_val[1:]
-                        if p_val.endswith("\n"):
-                            p_val = p_val[:-1]
-
-                        parsed_params[p_name] = self._convert_param_value(
-                            p_val, p_name, param_config, func_name
-                        )
-
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=tool_idx,
-                            name=func_name,
-                            parameters=json.dumps(parsed_params, ensure_ascii=False),
-                        )
+                    parsed_params[p_name] = self._convert_param_value(
+                        p_val, p_name, param_config, func_name
                     )
-                    tool_idx += 1
+
+                calls.append(
+                    ToolCallItem(
+                        tool_index=tool_idx,
+                        name=func_name,
+                        parameters=json.dumps(parsed_params, ensure_ascii=False),
+                    )
+                )
 
             # Determine normal text (text before the first tool call)
             start_idx = text.find(self.tool_call_start_token)
@@ -270,6 +294,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # 1. Priority detection: check if it's the start of Tool Call
             # -------------------------------------------------------
             if current_slice.startswith(self.tool_call_start_token):
+                self._close_open_function(calls)
                 self.parsed_pos += len(self.tool_call_start_token)
                 self.is_inside_tool_call = True
                 continue
@@ -282,6 +307,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 if end_angle != -1:
                     func_name = current_slice[len(self.tool_call_prefix) : end_angle]
 
+                    self._close_open_function(calls)
                     self.current_tool_id += 1
                     self.current_tool_name_sent = True
                     self.current_tool_param_count = 0
@@ -315,10 +341,18 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     # 1. [Normal] Encounter </parameter>
                     # 2. [Abnormal] Encounter next <parameter=
                     # 3. [Abnormal] Encounter </function>
+                    # 4. [Abnormal] Encounter </tool_call>, once the stream has ended
                     # So we need to find the smallest one as the parameter end position.
                     cand_end_param = rest_of_slice.find(self.parameter_end_token)
                     cand_next_param = rest_of_slice.find(self.parameter_prefix)
                     cand_end_func = rest_of_slice.find(self.function_end_token)
+                    # Mid-stream, </tool_call> may be literal text in a value that a
+                    # later </parameter> closes.
+                    cand_end_tool = (
+                        rest_of_slice.find(self.tool_call_end_token)
+                        if self._stream_ended
+                        else -1
+                    )
 
                     candidates = []
                     if cand_end_param != -1:
@@ -329,6 +363,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         candidates.append((cand_next_param, 0))
                     if cand_end_func != -1:
                         candidates.append((cand_end_func, 0))
+                    if cand_end_tool != -1:
+                        candidates.append((cand_end_tool, 0))
 
                     if candidates:
                         best_cand = min(candidates, key=lambda x: x[0])
@@ -407,6 +443,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # 5. Tool Call End: </tool_call>
             # -------------------------------------------------------
             if current_slice.startswith(self.tool_call_end_token):
+                self._close_open_function(calls)
                 self.parsed_pos += len(self.tool_call_end_token)
                 self.is_inside_tool_call = False  # [FIX] Exit tool call region
                 continue
@@ -472,6 +509,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         normal_text = "".join(normal_text_chunks) if normal_text_chunks else ""
         return StreamingParseResult(calls=calls, normal_text=normal_text)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        # No </parameter> can arrive any more, so a parameter still open ends at
+        # </tool_call>, as detect_and_parse reads it.
+        self._stream_ended = True
+        return self.parse_streaming_increment("", tools)
 
     def supports_structural_tag(self) -> bool:
         return True
