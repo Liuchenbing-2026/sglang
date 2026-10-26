@@ -385,7 +385,10 @@ class Glm47MoeDetector(BaseFormatDetector):
                 func_detail = self.func_detail_regex.search(match_result)
                 if func_detail is None:
                     continue
-                func_name = func_detail.group(1) if func_detail.group(1) else ""
+                # Models may emit a newline after the function name; strip it
+                # here so the non-streaming path agrees with the streaming one
+                # (`_extract_match_groups` already strips the name).
+                func_name = func_detail.group(1).strip() if func_detail.group(1) else ""
                 func_args = func_detail.group(2) if func_detail.group(2) else ""
                 arguments = {}
                 if func_args:
