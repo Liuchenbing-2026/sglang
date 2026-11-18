@@ -20,14 +20,8 @@ from sglang.srt.configs.laguna import LagunaConfig, normalize_gating
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
-from sglang.srt.layers.layer_boundary import (
-    append_stages,
-    declare_attn,
-    declare_ffn,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -698,7 +692,12 @@ class LagunaForCausalLM(nn.Module):
     def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
         return self.model.get_hidden_dim(module_name, layer_idx)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights_for_update(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        self.load_weights(weights, allow_partial=True)
+
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], *, allow_partial=False
+    ):
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
@@ -802,6 +801,9 @@ class LagunaForCausalLM(nn.Module):
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
+
+        if allow_partial:
+            return
 
         # If any routed-expert tensor was silently dropped (e.g. a future
         # checkpoint renaming `gate_proj`, or a ckpt-vs-mapping shape mismatch),

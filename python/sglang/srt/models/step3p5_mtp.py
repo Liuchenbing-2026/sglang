@@ -186,7 +186,9 @@ class Step3p5MTP(Step3p5ForCausalLM):
     def set_embed_and_head(self, embed, head):
         return
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]], *, allow_partial=False
+    ) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -286,7 +288,7 @@ class Step3p5MTP(Step3p5ForCausalLM):
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         params_need_to_load = set(params_dict.keys())
-        if params_need_to_load != loaded_params:
+        if not allow_partial and params_need_to_load != loaded_params:
             missing_params = list(params_need_to_load - loaded_params)
             param_name_example = missing_params[0]
             raise RuntimeError(

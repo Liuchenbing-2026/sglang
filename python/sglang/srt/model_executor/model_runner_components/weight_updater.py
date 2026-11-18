@@ -40,6 +40,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _load_weights_for_update(model, weights):
+    """Use a model's partial-load entrypoint for an online update bucket."""
+    loader = getattr(model, "load_weights_for_update", model.load_weights)
+    loader(weights)
+
+
 def _unsupported_derived_weight_cache_error(
     model: Optional[torch.nn.Module] = None,
 ) -> Optional[str]:
@@ -360,7 +366,7 @@ class WeightUpdater:
         if error is not None:
             return False, error
         try:
-            self.get_model().load_weights(named_tensors)
+            _load_weights_for_update(self.get_model(), named_tensors)
         except Exception as e:
             error_msg = (
                 f"Failed to update parameter online: {e}. "
@@ -408,7 +414,7 @@ class WeightUpdater:
             custom_loader = dynamic_import(load_format)
             custom_loader(self.get_model(), named_tensors)
         elif load_format is None:
-            self.get_model().load_weights(named_tensors)
+            _load_weights_for_update(self.get_model(), named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
@@ -441,7 +447,7 @@ class WeightUpdater:
         reconstructed_tensors = bucket.reconstruct_tensors()
 
         # Load the reconstructed tensors using the standard method
-        self.get_model().load_weights(reconstructed_tensors)
+        _load_weights_for_update(self.get_model(), reconstructed_tensors)
 
         return True, "Success"
 

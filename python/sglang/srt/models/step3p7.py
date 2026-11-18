@@ -9,10 +9,7 @@ from sglang.srt.configs.step3p7 import Step3p7Config
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
-from sglang.srt.managers.mm_utils import (
-    general_mm_embed_routine,
-    pad_mm_tokens,
-)
+from sglang.srt.managers.mm_utils import general_mm_embed_routine, pad_mm_tokens
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -153,7 +150,12 @@ class Step3p7ForConditionalGeneration(nn.Module):
     def set_embed_and_head(self, embed, head):
         self.language_model.set_embed_and_head(embed, head)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights_for_update(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        self.load_weights(weights, allow_partial=True)
+
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], *, allow_partial=False
+    ):
         weights = list(weights)
 
         vision_weights = []
@@ -190,7 +192,9 @@ class Step3p7ForConditionalGeneration(nn.Module):
 
         # Load language model weights
         if language_weights:
-            self.language_model.load_weights(language_weights)
+            self.language_model.load_weights(
+                language_weights, allow_partial=allow_partial
+            )
 
 
 EntryClass = Step3p7ForConditionalGeneration

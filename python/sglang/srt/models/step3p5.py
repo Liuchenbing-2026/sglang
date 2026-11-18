@@ -7,14 +7,8 @@ from torch import nn
 
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
-from sglang.srt.layers.layer_boundary import (
-    append_stages,
-    declare_attn,
-    declare_ffn,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
@@ -791,7 +785,16 @@ class Step3p5ForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+    def load_weights_for_update(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        self.load_weights(weights, allow_partial=True)
+
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn=False,
+        *,
+        allow_partial=False,
+    ):
         # NOTE:
         # Step3p5 HF checkpoints (e.g. MTP/nextn variants) may include an extra
         # "nextn predict layer" appended after the main decoder layers, such as:
@@ -927,6 +930,9 @@ class Step3p5ForCausalLM(nn.Module):
                             expert_id=expert_id,
                         )
                         loaded_params.add(actual_param_name)
+
+        if allow_partial:
+            return
 
         # Derived parameters (e.g. blockscale_swizzled from NVFP4 quantization)
         # are computed in process_weights_after_loading, not loaded from checkpoint.
